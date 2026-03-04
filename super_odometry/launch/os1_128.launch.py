@@ -71,7 +71,7 @@ def generate_launch_description():
         },
         parameters=[LaunchConfiguration("config_file"),
             { "calibration_file": LaunchConfiguration("calibration_file"),
-             "map_dir": os.path.join(home_directory, "/path/to/your/pcd"),
+             "map_dir": os.path.join(home_directory, "lidar_maps"),
         }],
         remappings=[
             ("laser_odom_to_init", LaunchConfiguration("odom_topic")),
@@ -90,6 +90,15 @@ def generate_launch_description():
         }],
     )
 
+    # Static TF: os_lidar -> os_imu (from calibration: imu^T_laser = [-0.006253, 0.011775, -0.007645])
+    # IMU position in lidar frame = -T = [0.006253, -0.011775, 0.007645]. Rotation is identity.
+    static_tf_lidar_imu = Node(
+        package="tf2_ros",
+        executable="static_transform_publisher",
+        name="ouster_lidar_imu_tf",
+        arguments=["0.006253", "-0.011775", "0.007645", "0", "0", "0", "os_lidar", "os_imu"],
+    )
+
     
     return LaunchDescription([
         launch_ros.actions.SetParameter(name='use_sim_time', value='false'),
@@ -103,4 +112,5 @@ def generate_launch_description():
         feature_extraction_node,
         laser_mapping_node,
         imu_preintegration_node,
+        static_tf_lidar_imu,
     ])

@@ -445,6 +445,15 @@ namespace super_odometry {
         //1. process imu odometry
         process_imu_odometry(lidarOdomTime, lidarPose);
 
+        // 1b. Publish imu path at laser rate (ensures /imuodom_path gets data even if IMU handler has timing issues)
+        if (doneFirstOpt && !imuQueImu.empty()) {
+            nav_msgs::msg::Odometry odom_for_path;
+            sensor_msgs::msg::Imu imu_for_stamp = imuQueImu.back();
+            gtsam::NavState state_at_lidar(prevPose_, prevVel_);
+            prepareOdometryMessage(odom_for_path, imu_for_stamp, state_at_lidar);
+            updateAndPublishPath(odom_for_path, imu_for_stamp);
+        }
+
         // 2. safe landing process
         double latest_imu_time = secs(&imuQueImu.back());
 
@@ -544,9 +553,13 @@ namespace super_odometry {
    void imuPreintegration::imuHandler(const sensor_msgs::msg::Imu::SharedPtr imu_raw) {
     std::lock_guard<std::mutex> lock(mBuf);
     
-    // 1. Pre-process IMU data
-    sensor_msgs::msg::Imu thisImu = imuConverter(*imu_raw);
-    assert(imu_raw->linear_acceleration.x != thisImu.linear_acceleration.x);
+    // 1. Pre-process IMU data (skip converter until IMU init complete - uses uninitialized data otherwise)
+    sensor_msgs::msg::Imu thisImu;
+    if (imu_init_success) {
+        thisImu = imuConverter(*imu_raw);
+    } else {
+        thisImu = *imu_raw;
+    }
 
     // 2. Handle IMU initialization for LIVOX sensor
     if (!handleIMUInitialization(imu_raw, thisImu)) {
@@ -701,12 +714,9 @@ void imuPreintegration::updateAndPublishPath(nav_msgs::msg::Odometry &odometry, 
                 abs(secs(&imuPath.poses.front()) -
                     secs(&imuPath.poses.back())) > 3.0)
             imuPath.poses.erase(imuPath.poses.begin());
-        if (pubImuPath->get_subscription_count() != 0)
-        {
-            imuPath.header.stamp = thisImu.header.stamp;
-            imuPath.header.frame_id = WORLD_FRAME;
-            pubImuPath->publish(imuPath);
-        }
+        imuPath.header.stamp = thisImu.header.stamp;
+        imuPath.header.frame_id = WORLD_FRAME;
+        pubImuPath->publish(imuPath);
     }
 }
 

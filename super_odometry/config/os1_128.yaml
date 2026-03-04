@@ -8,7 +8,7 @@
     
     world_frame: "map"
     world_frame_rot: "map_rot"
-    sensor_frame: "sensor"
+    sensor_frame: "os_lidar"
     sensor_frame_rot: "sensor_rot"
 
     imu_acc_x_limit: 0.5
