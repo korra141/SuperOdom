@@ -1,9 +1,11 @@
 import os
+from datetime import datetime
 
 from ament_index_python import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument
-from launch.substitutions import LaunchConfiguration, PythonExpression
+from launch.actions import DeclareLaunchArgument, ExecuteProcess, TimerAction
+from launch.conditions import IfCondition
+from launch.substitutions import LaunchConfiguration, PathJoinSubstitution, PythonExpression
 from launch_ros.actions import Node
 import launch_ros
 
@@ -49,6 +51,67 @@ def generate_launch_description():
         "sensor_frame_rot",
         default_value="sensor_rot",
     )
+    record_arg = DeclareLaunchArgument(
+        "record",
+        default_value="false",
+        description="Set to true to record all SuperOdometry output topics to a bag",
+    )
+    output_dir_arg = DeclareLaunchArgument(
+        "output_dir",
+        default_value=os.path.join(os.path.expanduser("~"), "bags"),
+        description="Parent directory where the bag folder will be created",
+    )
+    bag_name_arg = DeclareLaunchArgument(
+        "bag_name",
+        default_value=f"super_odom_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}",
+        description="Bag folder name (created inside output_dir)",
+    )
+
+    record_process = TimerAction(
+        period=3.0,  # wait for publishers to come up before subscribing
+        condition=IfCondition(LaunchConfiguration("record")),
+        actions=[ExecuteProcess(
+            cmd=[
+                "ros2", "bag", "record",
+                "--output", PathJoinSubstitution([
+                    LaunchConfiguration("output_dir"),
+                    LaunchConfiguration("bag_name"),
+                ]),
+                "--compression-mode", "file",
+                "--compression-format", "zstd",
+                # FeatureExtraction
+                "/velodyne_cloud_2",
+                "/feature_info",
+                "/bob_points",
+                "/planner_points",
+                "/edge_points",
+                # LaserMapping
+                "/laser_cloud_surround",
+                "/laser_cloud_map",
+                "/overall_map",
+                "/registered_scan",
+                "/laser_odometry",
+                "/aft_mapped_to_init_incremental",
+                "/vio_prediction",
+                "/lio_prediction",
+                "/laser_odom_path",
+                "/super_odometry_stats",
+                "/prediction_source",
+                # ImuPreintegration
+                "/state_estimation",
+                "/state_estimation_health",
+                "/imuodom_path",
+                # LidarSlam uncertainties
+                "/uncertainty_X",
+                "/uncertainty_Y",
+                "/uncertainty_Z",
+                "/uncertainty_roll",
+                "/uncertainty_pitch",
+                "/uncertainty_yaw",
+            ],
+            output="screen",
+        )],
+    )
 
     feature_extraction_node = Node(
         package="super_odometry",
@@ -92,12 +155,12 @@ def generate_launch_description():
 
     # Static TF: os_lidar -> os_imu (from calibration: imu^T_laser = [-0.006253, 0.011775, -0.007645])
     # IMU position in lidar frame = -T = [0.006253, -0.011775, 0.007645]. Rotation is identity.
-    static_tf_lidar_imu = Node(
-        package="tf2_ros",
-        executable="static_transform_publisher",
-        name="ouster_lidar_imu_tf",
-        arguments=["0.006253", "-0.011775", "0.007645", "0", "0", "0", "os_lidar", "os_imu"],
-    )
+    # static_tf_lidar_imu = Node(
+    #     package="tf2_ros",
+    #     executable="static_transform_publisher",
+    #     name="ouster_lidar_imu_tf",
+    #     arguments=["0.006253", "-0.011775", "0.007645", "0", "0", "0", "os_lidar", "os_imu"],
+    # )
 
     
     return LaunchDescription([
@@ -109,8 +172,12 @@ def generate_launch_description():
         world_frame_rot_arg,
         sensor_frame_arg,
         sensor_frame_rot_arg,
+        record_arg,
+        output_dir_arg,
+        bag_name_arg,
         feature_extraction_node,
         laser_mapping_node,
         imu_preintegration_node,
-        static_tf_lidar_imu,
+        # static_tf_lidar_imu,
+        record_process,
     ])

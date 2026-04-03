@@ -19,7 +19,7 @@ extrinsicTranslation_imu_laser: !!opencv-matrix
   dt: d
   #data: [0.0, 0.0, 0.0]
   # data: [0.002, 0.010, 0.031]
-  data: [-0.006253, 0.011775, -0.007645]
+  data: [-0.01, -0.125, -0.285]
 
 
 
