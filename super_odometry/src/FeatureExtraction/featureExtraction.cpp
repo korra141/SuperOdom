@@ -3,6 +3,11 @@
 //
 
 #include <super_odometry/FeatureExtraction/featureExtraction.h>
+#include "super_odometry/sensor_data/pointcloud/LidarPoint.h"  // for PointXYZITR
+#include <algorithm>
+#include <array>
+#include <numeric>
+#include <limits>
 #define RESET "\033[0m"
 #define BLACK "\033[30m"   /* Black */
 #define RED "\033[31m"     /* Red */
@@ -19,6 +24,178 @@
 
 
 namespace super_odometry {
+
+namespace {
+
+using SOPoint = point_os::PointcloudXYZITR;
+using OutPoint = pcl::PointXYZI;
+
+inline float pointRangeSq(const SOPoint& p) {
+    return p.x * p.x + p.y * p.y + p.z * p.z;
+}
+
+inline OutPoint toOutPoint(const SOPoint& p) {
+    OutPoint q;
+    q.x = p.x;
+    q.y = p.y;
+    q.z = p.z;
+    q.intensity = p.time;
+    return q;
+}
+
+void extractOrganizedScanFeatures(
+    const pcl::PointCloud<SOPoint>::Ptr& pc_in,
+    pcl::PointCloud<OutPoint>::Ptr& pc_out_corner,
+    pcl::PointCloud<OutPoint>::Ptr& pc_out_surf,
+    int n_scans,
+    int surface_stride,
+    float min_range)
+{
+    if (!pc_in || pc_in->empty() || n_scans <= 0) {
+        return;
+    }
+
+    constexpr int kNeighborSpan = 5;
+    constexpr int kNumSectors = 6;
+    constexpr int kMaxCornersPerSector = 20;
+    constexpr float kEdgeThreshold = 0.1f;
+    constexpr float kSurfThreshold = 0.1f;
+
+    std::vector<std::vector<int>> ring_indices(n_scans);
+    ring_indices.reserve(n_scans);
+
+    for (int i = 0; i < static_cast<int>(pc_in->points.size()); ++i) {
+        const auto& p = pc_in->points[i];
+        if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z)) {
+            continue;
+        }
+        if (static_cast<int>(p.ring) >= n_scans) {
+            continue;
+        }
+        if (pointRangeSq(p) < min_range * min_range) {
+            continue;
+        }
+        ring_indices[p.ring].push_back(i);
+    }
+
+    for (auto& ids : ring_indices) {
+        if (ids.size() < static_cast<size_t>(2 * kNeighborSpan + 1)) {
+            continue;
+        }
+
+        std::sort(ids.begin(), ids.end(), [&](int a, int b) {
+            return pc_in->points[a].time < pc_in->points[b].time;
+        });
+
+        const int N = static_cast<int>(ids.size());
+        std::vector<float> curvature(N, 0.0f);
+        std::vector<uint8_t> picked(N, 0);
+
+        for (int j = kNeighborSpan; j < N - kNeighborSpan; ++j) {
+            float diff_x = 0.0f, diff_y = 0.0f, diff_z = 0.0f;
+            for (int k = -kNeighborSpan; k <= kNeighborSpan; ++k) {
+                if (k == 0) continue;
+                const auto& pn = pc_in->points[ids[j + k]];
+                diff_x += pn.x;
+                diff_y += pn.y;
+                diff_z += pn.z;
+            }
+            const auto& p = pc_in->points[ids[j]];
+            diff_x -= 2.0f * kNeighborSpan * p.x;
+            diff_y -= 2.0f * kNeighborSpan * p.y;
+            diff_z -= 2.0f * kNeighborSpan * p.z;
+            curvature[j] = diff_x * diff_x + diff_y * diff_y + diff_z * diff_z;
+
+            // Light-weight occlusion / depth-discontinuity suppression.
+            const auto& p_prev = pc_in->points[ids[j - 1]];
+            const auto& p_next = pc_in->points[ids[j + 1]];
+            const float d_prev = (p.x - p_prev.x) * (p.x - p_prev.x) +
+                                 (p.y - p_prev.y) * (p.y - p_prev.y) +
+                                 (p.z - p_prev.z) * (p.z - p_prev.z);
+            const float d_next = (p.x - p_next.x) * (p.x - p_next.x) +
+                                 (p.y - p_next.y) * (p.y - p_next.y) +
+                                 (p.z - p_next.z) * (p.z - p_next.z);
+            if (d_prev > 0.25f || d_next > 0.25f) {
+                picked[j] = 1;
+            }
+        }
+
+        for (int sector = 0; sector < kNumSectors; ++sector) {
+            const int start = sector * N / kNumSectors;
+            const int end = (sector + 1) * N / kNumSectors - 1;
+            if (end - start < 2 * kNeighborSpan + 1) {
+                continue;
+            }
+
+            std::vector<int> order;
+            order.reserve(end - start + 1);
+            for (int j = start; j <= end; ++j) {
+                order.push_back(j);
+            }
+
+            std::sort(order.begin(), order.end(), [&](int a, int b) {
+                return curvature[a] > curvature[b];
+            });
+
+            int corner_count = 0;
+            for (int idx : order) {
+                if (idx < kNeighborSpan || idx >= N - kNeighborSpan) {
+                    continue;
+                }
+                if (picked[idx]) {
+                    continue;
+                }
+                if (curvature[idx] < kEdgeThreshold) {
+                    break;
+                }
+                pc_out_corner->push_back(toOutPoint(pc_in->points[ids[idx]]));
+                ++corner_count;
+                picked[idx] = 1;
+                for (int k = 1; k <= kNeighborSpan; ++k) {
+                    picked[idx + k] = 1;
+                    picked[idx - k] = 1;
+                }
+                if (corner_count >= kMaxCornersPerSector) {
+                    break;
+                }
+            }
+
+            std::sort(order.begin(), order.end(), [&](int a, int b) {
+                return curvature[a] < curvature[b];
+            });
+
+            int surf_counter = 0;
+            for (int idx : order) {
+                if (idx < kNeighborSpan || idx >= N - kNeighborSpan) {
+                    continue;
+                }
+                if (picked[idx]) {
+                    continue;
+                }
+                if (curvature[idx] > kSurfThreshold) {
+                    continue;
+                }
+                if ((surf_counter++ % std::max(1, surface_stride)) != 0) {
+                    continue;
+                }
+                pc_out_surf->push_back(toOutPoint(pc_in->points[ids[idx]]));
+                picked[idx] = 1;
+            }
+
+            // Keep a sparse fallback of the remaining valid points so we always
+            // have enough plane points in texture-poor sectors.
+            for (int j = start + kNeighborSpan; j <= end - kNeighborSpan; j += std::max(1, surface_stride * 2)) {
+                if (picked[j]) {
+                    continue;
+                }
+                pc_out_surf->push_back(toOutPoint(pc_in->points[ids[j]]));
+                picked[j] = 1;
+            }
+        }
+    }
+}
+
+} // namespace
     
     featureExtraction::featureExtraction(const rclcpp::NodeOptions & options)
     : Node("feature_extraction_node", options) {
@@ -130,6 +307,7 @@ namespace super_odometry {
         this->declare_parameter<int>("feature_extraction_node.filter_point_size", 3);
         this->declare_parameter<int>("feature_extraction_node.provide_point_time", 1);
         this->declare_parameter<bool>("feature_extraction_node.debug_view", false);
+        this->declare_parameter<bool>("feature_extraction_node.use_loam_features", false);
         this->declare_parameter<double>("feature_extraction_node.imu_acc_x_limit", 1.0);
         this->declare_parameter<double>("feature_extraction_node.imu_acc_y_limit", 1.0);
         this->declare_parameter<double>("feature_extraction_node.imu_acc_z_limit", 1.0);
@@ -149,6 +327,7 @@ namespace super_odometry {
         config_.provide_point_time = this->get_parameter("feature_extraction_node.provide_point_time").as_int();
         config_.use_dynamic_mask = this->get_parameter("feature_extraction_node.use_dynamic_mask").as_bool(); 
         config_.debug_view_enabled = this->get_parameter("feature_extraction_node.debug_view").as_bool();
+        config_.use_loam_features  = this->get_parameter("feature_extraction_node.use_loam_features").as_bool();
         config_.imu_acc_x_limit = this->get_parameter("feature_extraction_node.imu_acc_x_limit").as_double();
         config_.imu_acc_y_limit = this->get_parameter("feature_extraction_node.imu_acc_y_limit").as_double();
         config_.imu_acc_z_limit = this->get_parameter("feature_extraction_node.imu_acc_z_limit").as_double();
@@ -424,20 +603,42 @@ namespace super_odometry {
         const pcl::PointCloud<point_os::PointcloudXYZITR>::Ptr& lidar_msg,
         const Eigen::Quaterniond& quaternion)
     {
-        pcl::PointCloud<PointType>::Ptr plannerPoints(new pcl::PointCloud<PointType>());
-        plannerPoints->reserve(lidar_msg->points.size());
-        pcl::PointCloud<PointType>::Ptr edgePoints(new pcl::PointCloud<PointType>());
-        edgePoints->reserve(lidar_msg->points.size());
-        pcl::PointCloud<PointType>::Ptr bobPoints(new pcl::PointCloud<PointType>());
-        bobPoints->reserve(lidar_msg->points.size());
+        // original todo
+        //pcl::PointCloud<PointType>::Ptr plannerPoints(new pcl::PointCloud<PointType>());
+        //plannerPoints->reserve(lidar_msg->points.size());
+        //pcl::PointCloud<PointType>::Ptr edgePoints(new pcl::PointCloud<PointType>());
+        //edgePoints->reserve(lidar_msg->points.size());
+        //pcl::PointCloud<PointType>::Ptr bobPoints(new pcl::PointCloud<PointType>());
+        //bobPoints->reserve(lidar_msg->points.size());
 
-        uniformFeatureExtraction(lidar_msg, plannerPoints, config_.filter_point_size, config_.min_range);
-        
+        pcl::PointCloud<PointType>::Ptr plannerPoints(new pcl::PointCloud<PointType>());
+        pcl::PointCloud<PointType>::Ptr edgePoints(new pcl::PointCloud<PointType>());
+        pcl::PointCloud<PointType>::Ptr bobPoints(new pcl::PointCloud<PointType>());
+
+        if (config_.use_loam_features) {
+            // LOAM-style: curvature-based edge + planar feature extraction per ring
+            plannerPoints->reserve(lidar_msg->points.size() / std::max(1, config_.filter_point_size));
+            edgePoints->reserve(lidar_msg->points.size() / 20 + 1);
+            bobPoints->reserve(lidar_msg->points.size());
+            extractOrganizedScanFeatures(
+                lidar_msg,
+                edgePoints,
+                plannerPoints,
+                config_.N_SCANS,
+                config_.filter_point_size,
+                config_.min_range);
+        } else {
+            // Uniform mode: downsample + range filter, planar points only
+            plannerPoints->reserve(lidar_msg->points.size());
+            edgePoints->reserve(0);
+            bobPoints->reserve(0);
+            uniformFeatureExtraction(lidar_msg, plannerPoints, config_.filter_point_size, config_.min_range);
+        }
+
         publishTopic(lidar_start_time, lidar_msg, edgePoints, plannerPoints, bobPoints, quaternion);
     }
 
-
-    void featureExtraction::undistortionAndFeatureExtraction()      
+   void featureExtraction::undistortionAndFeatureExtraction()      
     {
         LASER_IMU_SYNC_SCCUESS = synchronize_measurements<Imu::Ptr>(imuBuf, lidarBuf);
         LASER_CAMERA_SYNC_SUCCESS = synchronize_measurements<nav_msgs::msg::Odometry::SharedPtr>(visualOdomBuf, lidarBuf);
@@ -456,21 +657,18 @@ namespace super_odometry {
 
             double lidar_end_time = lidar_start_time + lidar_msg->back().time;
 
-            if (LASER_IMU_SYNC_SCCUESS == true and LASER_CAMERA_SYNC_SUCCESS == true)
+            if (LASER_IMU_SYNC_SCCUESS == true)
             {
-                RCLCPP_INFO(this->get_logger(), "\033[1;32m----> Both IMU ,VIO laserscan are synchronized!.\033[0m");
-                removePointDistortion<nav_msgs::msg::Odometry::SharedPtr>(lidar_start_time, lidar_end_time, visualOdomBuf, lidar_msg);
-            }
-
-            if (LASER_IMU_SYNC_SCCUESS == false and LASER_CAMERA_SYNC_SUCCESS == true)
-            {
-                removePointDistortion<nav_msgs::msg::Odometry::SharedPtr>(lidar_start_time, lidar_end_time, visualOdomBuf, lidar_msg);
-            }
-
-            if (LASER_IMU_SYNC_SCCUESS == true and LASER_CAMERA_SYNC_SUCCESS == false)
-            {
-                // RCLCPP_INFO(this->get_logger(), "\033[1;32m----> IMU and laserscan is synchronized!.\033[0m");
+                if (LASER_CAMERA_SYNC_SUCCESS == true)
+                {
+                    RCLCPP_INFO(this->get_logger(), "\033[1;32m----> Both IMU and ODOM are synchronized; using IMU for undistortion.\033[0m");
+                }
                 removePointDistortion<Imu::Ptr>(lidar_start_time, lidar_end_time, imuBuf, lidar_msg);
+            }
+            else if (LASER_CAMERA_SYNC_SUCCESS == true)
+            {
+                RCLCPP_WARN(this->get_logger(), "Using ODOM_TOPIC as fallback for undistortion because IMU sync failed.");
+                removePointDistortion<nav_msgs::msg::Odometry::SharedPtr>(lidar_start_time, lidar_end_time, visualOdomBuf, lidar_msg);
             }
 
             // Extract features and publish
@@ -512,14 +710,21 @@ namespace super_odometry {
             point.z=pc_in->points[i].z;
             point.intensity=pc_in->points[i].time;
 
-            if ((abs(pc_in->points[i].x - pc_in->points[i-1].x) > 1e-7)
+            //if ((abs(pc_in->points[i].x - pc_in->points[i-1].x) > 1e-7)
+                //|| (abs(pc_in->points[i].y - pc_in->points[i-1].y) > 1e-7)
+                //| (abs(pc_in->points[i].z - pc_in->points[i-1].z) > 1e-7)
+                //&& (pc_in->points[i].x * pc_in->points[i].x + pc_in->points[i].y * pc_in->points[i].y + pc_in->points[i].z * pc_in->points[i].z > (block_range * block_range)))
+            //{
+                //pc_out_surf->push_back(point);
+            //}
+            if (((abs(pc_in->points[i].x - pc_in->points[i-1].x) > 1e-7)
                 || (abs(pc_in->points[i].y - pc_in->points[i-1].y) > 1e-7)
-                || (abs(pc_in->points[i].z - pc_in->points[i-1].z) > 1e-7)
+                || (abs(pc_in->points[i].z - pc_in->points[i-1].z) > 1e-7))
                 && (pc_in->points[i].x * pc_in->points[i].x + pc_in->points[i].y * pc_in->points[i].y + pc_in->points[i].z * pc_in->points[i].z > (block_range * block_range)))
             {
                 pc_out_surf->push_back(point);
             }
-        
+               
         }
         
     }

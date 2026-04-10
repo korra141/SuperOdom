@@ -147,8 +147,46 @@ namespace super_odometry {
         if ((summary.num_successful_steps == 1) ||(icp_iter == this->LocalizationICPMaxIter - 1)) {
             this->LocalizationUncertainty =
                     EstimateRegistrationError(problem, 100);
+
+            // Hessian-based constraint quality (from ceres::Covariance)
+            stats.hessian_pos_condition_num = LocalizationUncertainty.PosInverseConditionNum;
+            stats.hessian_ori_condition_num = LocalizationUncertainty.OriInverseConditionNum;
+            stats.hessian_var_x     = LocalizationUncertainty.Covariance(0, 0);
+            stats.hessian_var_y     = LocalizationUncertainty.Covariance(1, 1);
+            stats.hessian_var_z     = LocalizationUncertainty.Covariance(2, 2);
+            stats.hessian_var_roll  = LocalizationUncertainty.Covariance(3, 3);
+            stats.hessian_var_pitch = LocalizationUncertainty.Covariance(4, 4);
+            stats.hessian_var_yaw   = LocalizationUncertainty.Covariance(5, 5);
+
+            // Compute per-type residuals and association distance stats with the final pose
+            double edge_sum_sq = 0.0,  edge_assoc_sum = 0.0,  edge_assoc_max = 0.0;
+            double plane_sum_sq = 0.0, plane_assoc_sum = 0.0, plane_assoc_max = 0.0;
+            int edge_count = 0, plane_count = 0;
+            for (const auto& param : feature_corres) {
+                Eigen::Vector3d p_w = Q_w_curr * param.Xvalue + T_w_curr;
+                if (param.feature_type == FeatureType::EdgeFeature) {
+                    Eigen::Vector3d nu = (p_w - param.corres.first).cross(p_w - param.corres.second);
+                    double de = (param.corres.first - param.corres.second).norm();
+                    if (de > 1e-6) { edge_sum_sq += nu.squaredNorm() / (de * de); }
+                    edge_assoc_sum += param.assoc_distance;
+                    edge_assoc_max  = std::max(edge_assoc_max, param.assoc_distance);
+                    edge_count++;
+                } else {
+                    double d = param.NormDir.dot(p_w) + param.negative_OA_dot_norm;
+                    plane_sum_sq    += d * d;
+                    plane_assoc_sum += param.assoc_distance;
+                    plane_assoc_max  = std::max(plane_assoc_max, param.assoc_distance);
+                    plane_count++;
+                }
+            }
+            stats.edge_residual_rms     = edge_count  > 0 ? std::sqrt(edge_sum_sq  / edge_count)  : 0.0;
+            stats.plane_residual_rms    = plane_count > 0 ? std::sqrt(plane_sum_sq / plane_count) : 0.0;
+            stats.edge_assoc_dist_mean  = edge_count  > 0 ? edge_assoc_sum  / edge_count  : 0.0;
+            stats.edge_assoc_dist_max   = edge_assoc_max;
+            stats.plane_assoc_dist_mean = plane_count > 0 ? plane_assoc_sum / plane_count : 0.0;
+            stats.plane_assoc_dist_max  = plane_assoc_max;
             break;
-        
+
         }
 
       }
@@ -429,6 +467,7 @@ LidarSLAM::OptimizationParameter LidarSLAM::ComputeLineDistanceParameters(
     if (!validateNeighborSearch(found, nearest_pts, nearest_dist, result)) {
         return result;
     }
+    result.assoc_distance = std::sqrt(nearest_dist[0]);  // distance to nearest map edge point (metres)
 
     // 3. Compute and validate PCA
     if (!computePCAForFeature(nearest_pts, mean, eigenvalues, eigenvectors, result, FeatureType::EdgeFeature)) {
@@ -534,10 +573,11 @@ LidarSLAM::OptimizationParameter LidarSLAM::ComputePlaneDistanceParameters(
     // 3. Find nearest neighbors
     std::vector<Point> nearest_pts;
     std::vector<float> nearest_dist;
-    if (!findNearestNeighbors(local_map, pFinal, nearest_pts, nearest_dist, 
+    if (!findNearestNeighbors(local_map, pFinal, nearest_pts, nearest_dist,
                              requiredNearest, 5, square_max_dist, result)) {
         return result;
     }
+    result.assoc_distance = std::sqrt(nearest_dist[0]);  // distance to nearest map surf point (metres)
 
     // 4. Perform PCA analysis
     Eigen::Vector3d mean;

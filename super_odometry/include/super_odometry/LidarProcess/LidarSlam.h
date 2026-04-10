@@ -220,6 +220,7 @@ namespace super_odometry {
             std::pair<Eigen::Vector3d, Eigen::Vector3d> corres;
             double residualCoefficient;
             double TimeValue;
+            double assoc_distance = 0.0;  // sqrt of nearest-neighbour squared distance at match time (metres)
         };
 
     public:

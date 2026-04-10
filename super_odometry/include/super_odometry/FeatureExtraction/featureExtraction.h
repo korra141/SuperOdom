@@ -66,6 +66,8 @@ namespace super_odometry {
         bool use_dynamic_mask;
         bool use_imu_roll_pitch;
         bool debug_view_enabled;
+        bool use_loam_features;  // true = curvature-based LOAM edge+plane extraction
+                                 // false = uniform downsampling (planar only)
         float min_range;
         float max_range;
         int filter_point_size;

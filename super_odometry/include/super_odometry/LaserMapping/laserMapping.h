@@ -151,6 +151,8 @@ namespace super_odometry {
 
         bool useIMUPrediction(const Eigen::Quaterniond& imuPrediction);
 
+        void vioOdometryHandler(const nav_msgs::msg::Odometry::SharedPtr msgIn);
+
         void performSLAMOptimization();
 
         void updatePoseAndPublish();
@@ -240,6 +242,8 @@ namespace super_odometry {
         bool imuorientationAvailable = false;
         bool lastimuodomAvaliable=false;
         bool imu_initialized = false;
+        bool vio_initialized_ = false;
+        Transformd lastVioPose_;
 
 
         pcl::VoxelGrid<PointType> downSizeFilterCorner;

@@ -4,6 +4,7 @@
 
 #include "super_odometry/LaserMapping/laserMapping.h"
 
+
 double parameters[7] = {0, 0, 0, 0, 0, 0, 1};
 Eigen::Map<Eigen::Vector3d> t_w_curr(parameters);
 Eigen::Map<Eigen::Quaterniond> q_w_curr(parameters+3);
@@ -55,6 +56,11 @@ namespace super_odometry {
             ProjectName+"/feature_info", 2,
             std::bind(&laserMapping::laserFeatureInfoHandler, this,
                         std::placeholders::_1), sub_options);
+
+        subVisualOdometry = this->create_subscription<nav_msgs::msg::Odometry>(
+            "/ov_msckf/odomimu", 100,
+            std::bind(&laserMapping::vioOdometryHandler, this,
+                        std::placeholders::_1));
                         
 
         pubLaserCloudSurround = this->create_publisher<sensor_msgs::msg::PointCloud2>(
@@ -261,6 +267,12 @@ namespace super_odometry {
     }
 
 
+void laserMapping::vioOdometryHandler(const nav_msgs::msg::Odometry::SharedPtr msgIn) {
+    mBuf.lock();
+    visual_odom_buf.addMeas(msgIn, secs(msgIn));
+    mBuf.unlock();
+}
+
 void laserMapping::setInitialGuess()
 {
   //Case1: First Frame Initialization 
@@ -393,15 +405,18 @@ if(slam.isDegenerate){
     }
 
 }else{
-    // If system is not degenerate, use IMU orientation 
+    // Normal operation: prefer LIO > VIO > IMU orientation
     if(sensorMeas.lio_prediction_status){
         return PredictionSource::LIO_ODOM;
+    }
+    if(sensorMeas.vio_prediction_status){
+        return PredictionSource::VIO_ODOM;
     }
     sensorMeas.imu_orientation_status=useIMUPrediction(sensorMeas.imuPrediction);
     if(sensorMeas.imu_orientation_status){
         return PredictionSource::IMU_ORIENTATION;
     }
-   
+
 }
 
 
@@ -665,20 +680,81 @@ return PredictionSource::CONSTANT_VELOCITY;
         timeLaserOdometry=data.timestamp;
 
         //2. Extract point cloud data 
-        pcl::fromROSMsg(cornerLastBuf.front(), *laserCloudCornerLast);
+        // todo: change here so empty clouds dont call from rosmsg. 
+        auto valid_pc2 = [](const sensor_msgs::msg::PointCloud2& m){
+          if (m.width == 0 || m.height == 0) return false;
+          if (m.point_step == 0 || m.row_step == 0) return false;
+          if (m.data.empty()) return false;
+          const size_t expected = static_cast<size_t>(m.row_step) * static_cast<size_t>(m.height);
+          if (m.data.size() < expected) return false;
+          return true;
+        };
+        
+        auto log_if_empty = [&](const char* name, const sensor_msgs::msg::PointCloud2& m) {
+          const size_t expected = static_cast<size_t>(m.row_step) * static_cast<size_t>(m.height);
+
+          if (m.data.empty()) {
+             RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+               "%s EMPTY: data=0 (w=%u h=%u point_step=%u row_step=%u expected=%zu frame=%s)",
+               name, m.width, m.height, m.point_step, m.row_step, expected, m.header.frame_id.c_str());
+          } else if (expected > 0 && m.data.size() < expected) {
+            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+              "%s SHORT: data=%zu < expected=%zu (w=%u h=%u point_step=%u row_step=%u frame=%s)",
+              name, m.data.size(), expected, m.width, m.height, m.point_step, m.row_step, m.header.frame_id.c_str());
+          }
+        };
+
+        log_if_empty("cornerLastBuf.front()", cornerLastBuf.front());
+        if (valid_pc2(cornerLastBuf.front())) pcl::fromROSMsg(cornerLastBuf.front(), *laserCloudCornerLast);
+        else laserCloudCornerLast->clear();
         cornerLastBuf.pop();
-        pcl::fromROSMsg(surfLastBuf.front(), *laserCloudSurfLast);
+
+        log_if_empty("surfLastBuf.front()", surfLastBuf.front());
+        if (valid_pc2(surfLastBuf.front()))   pcl::fromROSMsg(surfLastBuf.front(),   *laserCloudSurfLast);
+        else laserCloudSurfLast->clear();
         surfLastBuf.pop();
-        pcl::fromROSMsg(fullResBuf.front(), *laserCloudFullRes);
+
+        log_if_empty("fullResBuf.front()", fullResBuf.front());
+        if (valid_pc2(fullResBuf.front()))    pcl::fromROSMsg(fullResBuf.front(),    *laserCloudFullRes);
+        else laserCloudFullRes->clear();
         fullResBuf.pop();
+        
+        //pcl::fromROSMsg(cornerLastBuf.front(), *laserCloudCornerLast);
+        //cornerLastBuf.pop();
+       // pcl::fromROSMsg(surfLastBuf.front(), *laserCloudSurfLast);
+       // surfLastBuf.pop();
+       // pcl::fromROSMsg(fullResBuf.front(), *laserCloudFullRes);
+       // fullResBuf.pop();
 
         //3. Extract IMU prediction 
         data.imuPrediction=IMUPredictionBuf.front();
         data.imuPrediction.normalize();
         IMUPredictionBuf.pop();
 
-        //4 set status for prediction source (TODO: didn't release code other prediction source yet) 
-        data.vio_prediction_status=false;
+        //4. Extract VIO prediction from OpenVINS if available
+        nav_msgs::msg::Odometry::SharedPtr vio_msg;
+        if (!visual_odom_buf.empty() && visual_odom_buf.getLastMeas(vio_msg)) {
+            const auto& p = vio_msg->pose.pose.position;
+            const auto& q = vio_msg->pose.pose.orientation;
+            Transformd currVioPose(
+                Eigen::Quaterniond(q.w, q.x, q.y, q.z),
+                Eigen::Vector3d(p.x, p.y, p.z));
+
+            if (!vio_initialized_) {
+                lastVioPose_ = currVioPose;
+                vio_initialized_ = true;
+                data.vio_prediction_status = false;
+            } else {
+                // Incremental IMU-frame motion from VINS: delta_T_imu = T_world_imu_prev^-1 * T_world_imu_curr
+                Transformd delta_imu = lastVioPose_.inverse() * currVioPose;
+                // Convert to lidar body frame: delta_T_lidar = T_imu_lidar^-1 * delta_T_imu * T_imu_lidar
+                data.vioPrediction = T_i_l.inverse() * delta_imu * T_i_l;
+                data.vio_prediction_status = true;
+                lastVioPose_ = currVioPose;
+            }
+        } else {
+            data.vio_prediction_status = false;
+        }
         data.lio_prediction_status=false;
         data.nio_prediction_status=false;
         data.imu_orientation_status=false;

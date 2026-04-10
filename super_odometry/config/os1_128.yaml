@@ -17,9 +17,12 @@
 
     # Feature Extraction Params
     feature_extraction_node:
-        scan_line: 128 
+        scan_line: 128
         min_range: 0.2    #<!-- remove too closed points -->
         filter_point_size: 3
+        # false = uniform downsampling, planar points only (original behaviour)
+        # true  = LOAM-style curvature-based edge + planar extraction per ring
+        use_loam_features: false
 
     # Laser Mapping Params
     laser_mapping_node:
